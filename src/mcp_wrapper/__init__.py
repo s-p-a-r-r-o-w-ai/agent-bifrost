@@ -1,8 +1,8 @@
 """MCP wrapper module for Agent Bifrost."""
 
-from .client import MultiServerMCPClient
-from .tools import load_mcp_tools, get_tool_by_name
-from .response_parser import (
+from src.mcp_wrapper.client import MultiServerMCPClient
+from src.mcp_wrapper.tools import load_mcp_tools, get_tool_by_name
+from src.mcp_wrapper.response_parser import (
     extract_indices_from_response,
     extract_mappings_from_response,
     extract_tabular_data_from_response,

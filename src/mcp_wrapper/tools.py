@@ -1,7 +1,7 @@
 from typing import List
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from core.config import settings
+from src.utils.llm import settings
 
 # Global reference to keep client alive
 _mcp_client: MultiServerMCPClient | None = None

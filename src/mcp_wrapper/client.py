@@ -1,7 +1,7 @@
 from typing import List, Dict, Any
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient as BaseMultiServerMCPClient
-from core.config import settings
+from src.utils.llm import settings
 
 class MultiServerMCPClient:
     """
