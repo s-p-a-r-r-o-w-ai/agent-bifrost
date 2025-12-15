@@ -1,7 +1,7 @@
 from typing import List, Dict, Any
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient as BaseMultiServerMCPClient
-from src.utils.llm import settings
+from src.llm.chat_model import settings
 
 class MultiServerMCPClient:
     """
@@ -26,7 +26,7 @@ class MultiServerMCPClient:
             return []
         
         try:
-             return await self.client.get_tools()
+            return await self.client.get_tools()
         except Exception as e:
             print(f"Error loading tools: {e}")
             # Printing simple traceback for debugging if needed but keeping it cleaner
@@ -38,6 +38,3 @@ class MultiServerMCPClient:
         """Close connections if needed."""
         if self.client and hasattr(self.client, "aclose"):
             await self.client.aclose()
-        elif self.client and hasattr(self.client, "close"):
-            if hasattr(self.client.close, "__await__") or hasattr(self.client.close, "__code__") and "async" in str(self.client.close):
-                 await self.client.close()

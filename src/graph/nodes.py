@@ -1,12 +1,16 @@
 """Node functions for the LangGraph workflow."""
 
-from typing import List, Dict, Any, Optional, Literal
+from typing import List, Literal
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessage
 
-from src.utils.state import AgentState
-from src.utils.llm import llm
-from src.utils.tools import load_mcp_tools, get_tool_by_name
+from src.utils.logger import get_logger
+
+logger = get_logger("es_agent")
+
+from src.graph.state import AgentState
+from src.llm.chat_model import llm
+from src.mcp_wrapper.tools import load_mcp_tools, get_tool_by_name
 from src.mcp_wrapper.response_parser import (
     extract_indices_from_response,
     extract_mappings_from_response,
@@ -45,6 +49,7 @@ class CriticOutput(BaseModel):
 
 async def list_indices_node(state: AgentState) -> AgentState:
     """Discover available indices using MCP tool."""
+    logger.info("Starting list_indices_node")
     # Extract user query from the first HumanMessage
     user_query = state.get("user_query")
     if not user_query and state.get("messages"):
@@ -57,6 +62,7 @@ async def list_indices_node(state: AgentState) -> AgentState:
     list_tool = get_tool_by_name(tools, "platform_core_list_indices")
     
     if not list_tool:
+        logger.error("platform_core_list_indices tool not available")
         return {
             "all_indices": [], 
             "execution_error": "platform_core_list_indices tool not available",
@@ -72,13 +78,15 @@ async def list_indices_node(state: AgentState) -> AgentState:
             return {
                 "all_indices": [], 
                 "execution_error": f"List indices failed: {error}",
-                "user_query": user_query
+                "user_query": user_query,
+                "messages": [AIMessage(content=f"Failed to list indices: {error}")]
             }
         
         # Extract indices and data streams
         indices, data_streams = extract_indices_from_response(result)
         all_indices = indices + data_streams
         
+        logger.info(f"Found {len(all_indices)} indices and data streams")
         return {
             "all_indices": all_indices,
             "user_query": user_query,  # Set extracted user query
@@ -86,27 +94,21 @@ async def list_indices_node(state: AgentState) -> AgentState:
         }
         
     except Exception as e:
+        logger.error(f"Failed to list indices: {str(e)}", exc_info=True)
         return {
             "all_indices": [], 
             "execution_error": f"Failed to list indices: {str(e)}",
-            "user_query": user_query
+            "user_query": user_query,
+            "messages": [AIMessage(content=f"Error listing indices: {str(e)}")]
         }
 
 
-async def select_indices_node(state: AgentState) -> AgentState:
-    """Select relevant indices using structured LLM output."""
-    if not state.get("all_indices"):
-        return {
-            "selected_indices": [], 
-            "execution_error": "No indices available",
-            "user_query": state.get("user_query")
-        }
-    
-    user_query = state.get("user_query", "")
-    prompt = f"""
+def _create_index_selection_prompt(user_query: str, available_indices: List[str]) -> str:
+    """Create prompt for index selection."""
+    return f"""
     IMPORTANT: The user asked: "{user_query}"
     
-    Available indices: {state["all_indices"]}
+    Available indices: {available_indices}
     
     Analyze the user query and select the most relevant indices:
     
@@ -123,6 +125,19 @@ async def select_indices_node(state: AgentState) -> AgentState:
     - "dec 2024" or "december 2024" → look for indices with "2024.12"
     - Match the time period in the query to the index naming pattern
     """
+
+async def select_indices_node(state: AgentState) -> AgentState:
+    """Select relevant indices using structured LLM output."""
+    logger.info("Starting select_indices_node")
+    if not state.get("all_indices"):
+        return {
+            "selected_indices": [], 
+            "execution_error": "No indices available",
+            "user_query": state.get("user_query")
+        }
+    
+    user_query = state.get("user_query", "")
+    prompt = _create_index_selection_prompt(user_query, state["all_indices"])
     
     structured_llm = llm.with_structured_output(IndexSelection)
     
@@ -177,12 +192,20 @@ async def get_mappings_node(state: AgentState) -> AgentState:
 
 async def generate_esql_node(state: AgentState) -> AgentState:
     """Generate ES|QL query using LLM."""
+    logger.info("Starting generate_esql_node")
+    # Optimize mappings for prompt - only include field names to avoid large payloads
+    mappings = state.get("mappings", {})
+    field_summary = {}
+    for index, mapping in mappings.items():
+        if isinstance(mapping, dict) and "properties" in mapping:
+            field_summary[index] = list(mapping["properties"].keys())[:50]  # Limit to 50 fields
+    
     prompt = f"""
     You are an expert ES|QL generator. Create an optimized, production-ready query.
     
     USER REQUEST: {state.get("user_query", "")}
     INDICES: {state.get("selected_indices", [])}
-    MAPPINGS: {state.get("mappings", {})}
+    AVAILABLE_FIELDS: {field_summary}
     
     GENERATE ES|QL QUERY following this structure:
     FROM index | WHERE filters | KEEP/DROP columns | EVAL computations | STATS aggregations | SORT | LIMIT
@@ -234,6 +257,7 @@ async def generate_esql_node(state: AgentState) -> AgentState:
 async def execute_esql_node(state: AgentState) -> AgentState:
     """Execute ES|QL query using MCP tool."""
     query = state.get("revised_esql_query") or state.get("esql_query")
+    logger.info(f"Executing ES|QL query: {query[:100]}...")
     if not query:
         return {"execution_error": "No ES|QL query to execute"}
     
@@ -357,7 +381,9 @@ async def finalize_answer_node(state: AgentState) -> AgentState:
     except Exception as e:
         return {
             "messages": [AIMessage(content=f"Failed to generate final answer: {str(e)}")],
-            "user_query": state.get("user_query")
+            "user_query": state.get("user_query"),
+            "query_result": state.get("query_result"),
+            "execution_error": f"Finalize answer failed: {str(e)}"
         }
 
 
@@ -397,7 +423,9 @@ async def critic_node(state: AgentState) -> AgentState:
             "critique": {},
             "improved_answer": current_answer,
             "execution_error": f"Critic failed: {str(e)}",
-            "user_query": state.get("user_query")
+            "user_query": state.get("user_query"),
+            "query_result": state.get("query_result"),
+            "messages": [AIMessage(content=current_answer)]
         }
 
 
@@ -405,13 +433,15 @@ async def critic_node(state: AgentState) -> AgentState:
 # CONDITIONAL ROUTING
 # ============================================================================
 
+# Configuration constants
+MAX_RETRY_ATTEMPTS = 3
+
 def should_retry(state: AgentState) -> Literal["esql_evaluator", "finalize_answer"]:
     """Determine if we should retry or finalize based on execution results."""
     has_error = bool(state.get("execution_error"))
     retry_count = state.get("retry_count", 0)
-    max_retries = 3
     
-    if has_error and retry_count < max_retries:
+    if has_error and retry_count < MAX_RETRY_ATTEMPTS:
         return "esql_evaluator"
     return "finalize_answer"
 

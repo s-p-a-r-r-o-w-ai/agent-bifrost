@@ -6,6 +6,10 @@ All MCP tools return responses in a nested structure that needs careful parsing.
 import json
 from typing import Dict, List, Any, Optional, Tuple
 
+from src.utils.logger import get_logger
+
+logger = get_logger("mcp_response_parser")
+
 
 def parse_mcp_response(response: Any) -> Dict[str, Any]:
     """
@@ -39,7 +43,7 @@ def parse_mcp_response(response: Any) -> Dict[str, Any]:
         return {"results": []}
         
     except (json.JSONDecodeError, KeyError, IndexError) as e:
-        print(f"Failed to parse MCP response: {e}")
+        logger.error(f"Failed to parse MCP response: {e}")
         return {"results": []}
 
 
@@ -68,7 +72,7 @@ def extract_indices_from_response(response: Any) -> Tuple[List[str], List[str]]:
             data_streams = [stream["name"] for stream in streams_data if stream.get("name")]
             
     except (KeyError, IndexError, TypeError) as e:
-        print(f"Failed to extract indices: {e}")
+        logger.error(f"Failed to extract indices: {e}")
     
     return indices, data_streams
 
@@ -90,7 +94,7 @@ def extract_mappings_from_response(response: Any) -> Dict[str, Any]:
             mappings = data.get("mappings", {})
             
     except (KeyError, IndexError, TypeError) as e:
-        print(f"Failed to extract mappings: {e}")
+        logger.error(f"Failed to extract mappings: {e}")
     
     return mappings
 
@@ -119,7 +123,7 @@ def extract_esql_from_response(response: Any) -> Tuple[Optional[str], Optional[s
                 explanation = data.get("answer")
                 
     except (KeyError, IndexError, TypeError) as e:
-        print(f"Failed to extract ES|QL: {e}")
+        logger.error(f"Failed to extract ES|QL: {e}")
     
     return query, explanation
 
@@ -158,7 +162,7 @@ def extract_tabular_data_from_response(response: Any) -> Dict[str, Any]:
                 result_data["query"] = data.get("esql")
                 
     except (KeyError, IndexError, TypeError) as e:
-        print(f"Failed to extract tabular data: {e}")
+        logger.error(f"Failed to extract tabular data: {e}")
     
     return result_data
 
@@ -177,18 +181,19 @@ def format_tabular_data_for_display(tabular_data: Dict[str, Any]) -> str:
     header = " | ".join([col["name"] for col in columns])
     separator = "-" * len(header)
     
+    def _format_cell_value(value: Any) -> str:
+        """Format a single cell value for display."""
+        if value is None:
+            return "null"
+        elif isinstance(value, str) and len(value) > 50:
+            return value[:47] + "..."
+        else:
+            return str(value)
+    
     # Format rows
     rows = []
     for row in values[:10]:  # Limit to first 10 rows for display
-        formatted_row = []
-        for i, value in enumerate(row):
-            # Handle different data types
-            if value is None:
-                formatted_row.append("null")
-            elif isinstance(value, str) and len(value) > 50:
-                formatted_row.append(value[:47] + "...")
-            else:
-                formatted_row.append(str(value))
+        formatted_row = [_format_cell_value(value) for value in row]
         rows.append(" | ".join(formatted_row))
     
     result = f"{header}\n{separator}\n" + "\n".join(rows)
@@ -213,5 +218,6 @@ def extract_error_from_response(response: Any) -> Optional[str]:
                 
         return None
         
-    except Exception:
+    except (KeyError, IndexError, TypeError) as e:
+        logger.error(f"Failed to extract error from response: {e}")
         return None

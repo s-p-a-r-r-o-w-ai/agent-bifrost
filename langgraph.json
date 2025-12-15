@@ -3,7 +3,7 @@
         "."
     ],
     "graphs": {
-        "agent": "./src/agent.py:compile_graph"
+        "agent": "./src/es_agent.py:compile_graph"
     },
     "env": ".env"
 }

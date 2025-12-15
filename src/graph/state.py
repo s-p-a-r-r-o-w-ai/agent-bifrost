@@ -23,10 +23,10 @@ class AgentState(MessagesState):
     # ---- Execution ----
     query_result: Optional[Any]
     execution_error: Optional[str]
-    retry_count: int
+    retry_count: int = 0
 
     # ---- Control flags ----
-    generation_success: bool
+    generation_success: bool = False
 
     # ---- Critic / reflection (STRUCTURED) ----
     critique: Optional[Dict[str, Any]]
