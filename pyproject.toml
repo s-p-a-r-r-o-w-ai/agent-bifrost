@@ -5,10 +5,7 @@ description = "Multi-agent Elasticsearch and Kibana project with LangGraph and M
 authors = ["Your Name <you@example.com>"]
 readme = "README.md"
 packages = [
-    { include = "agents" },
-    { include = "core" },
-    { include = "mcp_wrapper" },
-    { include = "graph" }
+    { include = "src" }
 ]
 
 [tool.poetry.dependencies]

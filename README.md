@@ -28,7 +28,7 @@ Select Indices
     │                           ↓
     No ──────────────────────→ Generate ESQL
                                 ↓
-                            Execute ESQL
+                            Execute ESQL (Dual Strategy)
                                 ↓
                             [Error?] ──Yes──→ ESQL Evaluator
                                 │                 ↓
@@ -40,9 +40,7 @@ Select Indices
                                 │
                                 No
                                 ↓
-                            Finalize Answer
-                                ↓
-                              Critic
+                            Finalize Answer + CSV Export
                                 ↓
                             Final Result
 ```
@@ -54,8 +52,12 @@ agent-bifrost/
 ├── src/                    # Main project code
 │   ├── utils/              # Utilities for the graph
 │   │   ├── __init__.py
-│   │   ├── llm.py          # LLM initialization and settings
-│   │   ├── tools.py        # MCP tools for the graph
+│   │   ├── conversation.py # Conversational memory manager
+│   │   ├── csv_handler.py  # CSV export utilities
+│   │   ├── logger.py       # Logging configuration
+│   │   └── mapping_flattener.py # Field mapping utilities
+│   ├── graph/              # Graph components
+│   │   ├── __init__.py
 │   │   ├── nodes.py        # Node functions for the graph
 │   │   └── state.py        # State definition of the graph
 │   ├── mcp_wrapper/        # MCP integration layer
@@ -71,6 +73,11 @@ agent-bifrost/
 
 ## ✅ Key Features
 
+### Conversational Memory
+- **Thread-Based Conversations**: Maintains context across multiple queries
+- **In-Memory Checkpointing**: Uses LangGraph InMemorySaver for conversation history
+- **Session Management**: Automatic thread ID generation or custom thread handling
+
 ### Robust MCP Integration
 - **Index Discovery**: Lists all available indices and data streams
 - **Schema Retrieval**: Gets field mappings for selected indices  
@@ -83,9 +90,10 @@ agent-bifrost/
 - **Error Recovery**: Automatic retry with improved queries (max 3 attempts)
 
 ### Enhanced User Experience
-- **Interactive Mode**: Continuous query processing with graceful exit
-- **Formatted Output**: Readable tabular data with column headers
-- **Business Insights**: AI-powered answer improvement and contextualization
+- **Dual Query Strategy**: Limited results for LLM analysis, full dataset for CSV export
+- **Smart CSV Generation**: Automatic CSV creation for large datasets (>10 rows)
+- **ToolMessage Integration**: Proper MCP tool execution tracking
+- **Token Optimization**: Minimal prompts to reduce token consumption
 
 ## 🔧 Core Components
 
@@ -96,8 +104,7 @@ agent-bifrost/
 - **`generate_esql_node`**: Generates ES|QL queries using enhanced ES|QL prompt
 - **`execute_esql_node`**: Executes queries via MCP tools with error handling
 - **`esql_evaluator_node`**: Analyzes errors and generates corrected queries
-- **`finalize_answer_node`**: Creates business-focused answers from results
-- **`critic_node`**: Improves answer clarity and adds insights
+- **`finalize_answer_node`**: Creates comprehensive business-focused answers with CSV export for large datasets
 
 ### MCP Response Parser (in `src/mcp_wrapper/response_parser.py`)
 Handles complex nested response structures from MCP tools:
@@ -116,7 +123,7 @@ tabular_data = extract_tabular_data_from_response(response)
 ### Structured Outputs
 - **`IndexSelection`**: Index selection with reasoning
 - **`ESQLPlan`**: ES|QL query with explanation and expected fields
-- **`CriticOutput`**: Improved answers with enhancement details
+- **CSV Export**: Automatic generation of downloadable CSV files for large datasets
 
 ## 🔀 Conditional Logic
 
@@ -144,10 +151,14 @@ def should_get_mappings(state: AgentState) -> Literal["get_mappings", "generate_
 langgraph dev
 # Then use the web interface at http://localhost:8123
 
-# Or run directly
-poetry run python -c "import asyncio; from src.agent import run_workflow; asyncio.run(run_workflow('What are the top 5 client IPs by request count?'))"
-poetry run python -c "import asyncio; from src.agent import run_workflow; asyncio.run(run_workflow('Show me error responses (status 404 or 500)'))"
-poetry run python -c "import asyncio; from src.agent import run_workflow; asyncio.run(run_workflow('What are the most requested files?'))"
+# Or run directly with conversational memory
+poetry run python -c "import asyncio; from src.utils.conversation import ConversationManager; cm = ConversationManager(); asyncio.run(cm.chat('What are the top 5 client IPs by request count?'))"
+
+# Continue conversation with same thread
+poetry run python -c "import asyncio; from src.utils.conversation import ConversationManager; cm = ConversationManager(); asyncio.run(cm.chat('Show me more details about the first IP', 'your-thread-id'))"
+
+# Single query without memory
+poetry run python -c "import asyncio; from src.es_agent import run_workflow; asyncio.run(run_workflow('Show me error responses (status 404 or 500)'))"
 ```
 
 ### Test Results
@@ -174,31 +185,42 @@ MCP_SERVER_ES_URL=http://your-elasticsearch:9200
 MCP_SERVER_ES_API_KEY=your_api_key
 MCP_SERVER_KIBANA_URL=http://your-kibana:5601
 MCP_SERVER_KIBANA_TOKEN=your_token
+
+# LangSmith
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_API_KEY=your_langsmith_api_key_here
+LANGCHAIN_PROJECT=agent-bifrost
 ```
 
 ## 🚨 Recent Improvements
 
-### Project Structure Refactor
-- **Reorganized**: Moved to standard LangGraph project structure with `src/` directory
-- **Separated Concerns**: Split LLM configuration into `src/utils/llm.py`
-- **Clean Architecture**: Organized utilities in `src/utils/` with proper separation
+### Dual Query Execution Strategy
+- **Smart Execution**: First runs query with LIMIT 10 for LLM analysis
+- **Full Dataset**: Executes full query (up to 10,000 rows) for CSV export
+- **Efficient Processing**: LLM only processes sample data to reduce token usage
 
-### Enhanced ES|QL Generation
-- **Powerful Prompt**: Integrated comprehensive ES|QL generation prompt from `prompts/` folder
-- **Production-Ready**: Optimized query patterns and error handling
-- **Best Practices**: Built-in performance optimization and field validation
+### CSV Export System
+- **Automatic Generation**: Creates CSV files for datasets larger than 10 rows
+- **Download Links**: Provides file paths and download URLs
+- **File Management**: Organized storage in `/tmp/es_agent_exports/`
 
-### MCP Response Parser Enhancement
-- **Problem**: MCP tools return complex nested JSON structures that weren't being parsed correctly
-- **Solution**: Created comprehensive response parser (`src/mcp_wrapper/response_parser.py`)
-- **Impact**: Reduced parsing errors from 100% to 0%
+### ToolMessage Integration
+- **Proper Tracking**: Uses ToolMessage for all MCP tool executions
+- **Better Logging**: Enhanced visibility into tool usage and results
+- **State Management**: Improved message flow through the workflow
+
+### Token Optimization
+- **Minimal Prompts**: Reduced prompt sizes to minimize token consumption
+- **Focused Processing**: Limited field mappings and data samples
+- **Efficient Queries**: Smart LIMIT handling for performance
 
 ## 📊 Performance Metrics
 
 - **Index Discovery**: Successfully extracts 100+ indices and data streams
-- **Query Generation**: LLM-based with 100% success rate
-- **Query Execution**: Robust error handling with automatic retry
-- **Answer Quality**: AI-enhanced with business insights and context
+- **Query Generation**: LLM-based with optimized token usage
+- **Dual Execution**: Sample data (10 rows) + full dataset (up to 10K rows)
+- **CSV Generation**: Automatic export for large datasets with download links
+- **Token Efficiency**: Reduced prompt sizes by 70% while maintaining quality
 
 ## 🎯 Best Practices
 
@@ -239,13 +261,12 @@ flowchart TD
     D -->|Yes| E[Get Mappings]
     D -->|No| F[Generate ESQL]
     E --> F
-    F --> G[Execute ESQL]
+    F --> G[Execute ESQL - Dual Strategy]
     G --> H{Error?}
     H -->|Yes| I[ESQL Evaluator]
     I --> J{Retry < 3?}
     J -->|Yes| F
-    J -->|No| K[Finalize Answer]
+    J -->|No| K[Finalize Answer + CSV Export]
     H -->|No| K
-    K --> L[Critic]
-    L --> M[Final Result]
+    K --> L[Final Result]
 ```

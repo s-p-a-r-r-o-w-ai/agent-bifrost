@@ -2,8 +2,8 @@
 
 from typing import Dict, Any
 from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_core.messages import HumanMessage
+import uuid
 
 from src.config.settings import settings
 from src.utils.logger import setup_logger, get_logger
@@ -17,9 +17,7 @@ from src.graph import (
     execute_esql_node,
     esql_evaluator_node,
     finalize_answer_node,
-    critic_node,
-    should_retry,
-    should_get_mappings
+    should_retry
 )
 
 # Initialize logger
@@ -45,29 +43,28 @@ def create_workflow() -> StateGraph:
     workflow.add_node("execute_esql", execute_esql_node)
     workflow.add_node("esql_evaluator", esql_evaluator_node)
     workflow.add_node("finalize_answer", finalize_answer_node)
-    workflow.add_node("critic", critic_node)
     
     # Define the flow
     workflow.add_edge(START, "list_indices")
     workflow.add_edge("list_indices", "select_indices")
-    workflow.add_conditional_edges("select_indices", should_get_mappings)
+    workflow.add_edge("select_indices", "get_mappings")
     workflow.add_edge("get_mappings", "generate_esql")
     workflow.add_edge("generate_esql", "execute_esql")
     workflow.add_conditional_edges("execute_esql", should_retry)
     workflow.add_edge("esql_evaluator", "execute_esql")  # Retry loop
-    workflow.add_edge("finalize_answer", "critic")
-    workflow.add_edge("critic", END)
+    workflow.add_edge("finalize_answer", END)
     
     return workflow
 
 
-async def run_workflow(user_query: str) -> Dict[str, Any]:
-    """Execute the complete workflow for a user query."""
-    logger.info(f"Starting workflow for query: {user_query[:100]}...")
+async def run_workflow(user_query: str, thread_id: str = None) -> Dict[str, Any]:
+    """Execute the complete workflow for a user query with conversational memory."""
+    if thread_id is None:
+        thread_id = str(uuid.uuid4())
+    
+    logger.info(f"Starting workflow for query: {user_query[:100]}... (thread: {thread_id})")
     try:
-        workflow = create_workflow()
-        memory = MemorySaver()
-        app = workflow.compile(checkpointer=memory)
+        app = compile_graph
         
         # Initial state
         initial_state = {
@@ -77,8 +74,8 @@ async def run_workflow(user_query: str) -> Dict[str, Any]:
             "generation_success": False
         }
         
-        # Execute workflow
-        config = {"configurable": {"thread_id": "main"}}
+        # Execute workflow with thread-specific memory
+        config = {"configurable": {"thread_id": thread_id}}
         logger.debug(f"Executing workflow with config: {config}")
         final_state = await app.ainvoke(initial_state, config)
         
@@ -93,5 +90,5 @@ async def run_workflow(user_query: str) -> Dict[str, Any]:
         }
 
 
-# Export for LangGraph dev server
+# Export for LangGraph dev server (persistence handled by platform)
 compile_graph = create_workflow().compile()

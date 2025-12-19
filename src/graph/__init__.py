@@ -13,9 +13,7 @@ from src.graph.nodes import (
     execute_esql_node,
     esql_evaluator_node,
     finalize_answer_node,
-    critic_node,
-    should_retry,
-    should_get_mappings
+    should_retry
 )
 
 __all__ = [
@@ -27,7 +25,5 @@ __all__ = [
     "execute_esql_node",
     "esql_evaluator_node",
     "finalize_answer_node",
-    "critic_node",
-    "should_retry",
-    "should_get_mappings"
+    "should_retry"
 ]

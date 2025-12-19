@@ -10,7 +10,7 @@ class AgentState(MessagesState):
     selected_indices: Optional[List[str]]
 
     # ---- Schema / metadata ----
-    mappings: Optional[Dict[str, Any]]
+    flattened_fields: Optional[Dict[str, str]]
     field_categories: Optional[Dict[str, List[str]]]
     index_patterns: Optional[List[str]]
 
@@ -21,13 +21,14 @@ class AgentState(MessagesState):
     revised_esql_query: Optional[str]
 
     # ---- Execution ----
-    query_result: Optional[Any]
+    query_result: Optional[Any]  # Limited result for LLM
+    full_query_result: Optional[Any]  # Full dataset for CSV
     execution_error: Optional[str]
     retry_count: int = 0
 
     # ---- Control flags ----
     generation_success: bool = False
 
-    # ---- Critic / reflection (STRUCTURED) ----
-    critique: Optional[Dict[str, Any]]
-    improved_answer: Optional[str]
+    # ---- CSV Export ----
+    csv_file_path: Optional[str]
+    csv_download_url: Optional[str]

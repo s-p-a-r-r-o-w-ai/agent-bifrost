@@ -1,7 +1,7 @@
 from typing import List
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from src.llm.chat_model import settings
+from src.config.settings import settings
 
 class MCPToolsManager:
     """Singleton manager for MCP tools to avoid global variable issues."""

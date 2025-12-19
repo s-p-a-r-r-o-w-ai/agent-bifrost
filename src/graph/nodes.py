@@ -1,10 +1,12 @@
 """Node functions for the LangGraph workflow."""
 
-from typing import List, Literal
+from typing import List, Literal, Dict, Any
 from pydantic import BaseModel, Field
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
 from src.utils.logger import get_logger
+from src.utils.csv_handler import save_query_result_to_csv, generate_download_url, get_csv_summary
+from src.utils.mapping_flattener import deduplicate_fields_across_indices
 
 logger = get_logger("es_agent")
 
@@ -27,20 +29,15 @@ from src.mcp_wrapper.response_parser import (
 class IndexSelection(BaseModel):
     """Structured output for index selection."""
     selected_indices: List[str] = Field(description="List of relevant index names")
-    reasoning: str = Field(description="Why these indices were selected")
 
 
 class ESQLPlan(BaseModel):
     """Structured output for ES|QL generation."""
     query: str = Field(description="The ES|QL query")
-    explanation: str = Field(description="What the query does")
     expected_fields: List[str] = Field(description="Expected result fields")
 
 
-class CriticOutput(BaseModel):
-    """Structured output for critic feedback."""
-    improved_answer: str = Field(description="Enhanced final answer")
-    improvements_made: List[str] = Field(description="List of improvements", default_factory=list)
+
 
 
 # ============================================================================
@@ -72,6 +69,12 @@ async def list_indices_node(state: AgentState) -> AgentState:
     try:
         result = await list_tool.ainvoke({})
         
+        # Add ToolMessage for MCP tool execution
+        tool_message = ToolMessage(
+            content=f"Listed indices using {list_tool.name}",
+            tool_call_id="list_indices_call"
+        )
+        
         # Check for errors first
         error = extract_error_from_response(result)
         if error:
@@ -79,7 +82,7 @@ async def list_indices_node(state: AgentState) -> AgentState:
                 "all_indices": [], 
                 "execution_error": f"List indices failed: {error}",
                 "user_query": user_query,
-                "messages": [AIMessage(content=f"Failed to list indices: {error}")]
+                "messages": [tool_message, AIMessage(content=f"Failed to list indices: {error}")]
             }
         
         # Extract indices and data streams
@@ -89,8 +92,8 @@ async def list_indices_node(state: AgentState) -> AgentState:
         logger.info(f"Found {len(all_indices)} indices and data streams")
         return {
             "all_indices": all_indices,
-            "user_query": user_query,  # Set extracted user query
-            "messages": [AIMessage(content=f"Found {len(all_indices)} indices and data streams")]
+            "user_query": user_query,
+            "messages": [tool_message, AIMessage(content=f"Found {len(all_indices)} indices and data streams")]
         }
         
     except Exception as e:
@@ -103,28 +106,55 @@ async def list_indices_node(state: AgentState) -> AgentState:
         }
 
 
-def _create_index_selection_prompt(user_query: str, available_indices: List[str]) -> str:
-    """Create prompt for index selection."""
+def _create_index_selection_prompt(user_query: str, available_indices: list[str]) -> str:
     return f"""
-    IMPORTANT: The user asked: "{user_query}"
-    
-    Available indices: {available_indices}
-    
-    Analyze the user query and select the most relevant indices:
-    
-    Query Analysis:
-    - If query mentions "orders", "order", "purchase" → select fluent-order-* or fluent-item_order-* indices
-    - If query mentions "fulfilment", "fulfillment", "shipping" → select fluent-fulfilment-* or fluent-item_fulfilment-* indices  
-    - If query mentions "inventory", "stock", "position" → select fluent-inventory_position-* indices
-    - If query mentions "exception", "error", "failed" → select fluent-exception-* indices
-    - If query mentions "return", "refund" → select fluent-item_return_order-* indices
-    - If query mentions "logs", "web", "access" → select kibana_sample_data_logs
-    
-    Time Period Matching:
-    - "nov 2025" or "november 2025" → look for indices with "2025.11"
-    - "dec 2024" or "december 2024" → look for indices with "2024.12"
-    - Match the time period in the query to the index naming pattern
-    """
+You are an expert Elasticsearch index-selection agent.
+
+TASK
+----
+From the provided list ONLY, select the MOST relevant index names or wildcard
+patterns needed to answer the user query. Choose the smallest accurate set.
+
+INPUTS
+------
+User query:
+{user_query}
+
+Available indices:
+{available_indices}
+
+SELECTION LOGIC
+---------------
+1. Infer intent and business domain from the query
+   (orders, order items, fulfillments, inventory, returns, errors, logs, etc.).
+   - Distinguish aggregate vs item-level entities.
+   - If both are implied, include both.
+
+2. Match inferred concepts to index names by semantic meaning,
+   not hardcoded keyword rules.
+   - Prefer clearly aligned indices.
+   - Use wildcards for versioned or date-suffixed indices (e.g., orders-*).
+
+3. Time awareness:
+   - If a time range/month/year is mentioned, narrow the pattern accordingly
+     (YYYY, YYYY.MM, YYYY.MM.DD).
+   - If no time is mentioned, use a relevant broad wildcard.
+
+4. Precision rules:
+   - Do not select weakly related indices.
+   - Do not invent indices.
+   - Prefer fewer, higher-confidence indices.
+
+OUTPUT (STRICT)
+---------------
+Return ONLY valid JSON:
+
+{{"selected_indices": ["index1", "index2"]}}
+
+No extra text.
+
+"""
+
 
 async def select_indices_node(state: AgentState) -> AgentState:
     """Select relevant indices using structured LLM output."""
@@ -146,7 +176,7 @@ async def select_indices_node(state: AgentState) -> AgentState:
         return {
             "selected_indices": result.selected_indices,
             "user_query": state.get("user_query"),  # Preserve user query
-            "messages": [AIMessage(content=f"Selected indices: {result.selected_indices}. Reasoning: {result.reasoning}")]
+            "messages": [AIMessage(content=f"Selected indices: {result.selected_indices}.")]
         }
     except Exception as e:
         return {
@@ -157,60 +187,62 @@ async def select_indices_node(state: AgentState) -> AgentState:
 
 
 async def get_mappings_node(state: AgentState) -> AgentState:
-    """Fetch index mappings using MCP tool."""
+    """Fetch and flatten index mappings using MCP tool."""
     if not state.get("selected_indices"):
-        return {"mappings": {}, "execution_error": "No indices selected"}
+        return {"flattened_fields": {}, "execution_error": "No indices selected"}
     
     tools = await load_mcp_tools()
     mapping_tool = get_tool_by_name(tools, "platform_core_get_index_mapping")
     
     if not mapping_tool:
-        return {"mappings": {}, "execution_error": "platform_core_get_index_mapping tool not available"}
+        return {"flattened_fields": {}, "execution_error": "platform_core_get_index_mapping tool not available"}
     
     try:
         result = await mapping_tool.ainvoke({"indices": state["selected_indices"]})
         
+        tool_message = ToolMessage(
+            content=f"Retrieved mappings using {mapping_tool.name}",
+            tool_call_id="get_mappings_call"
+        )
+        
         # Check for errors
         error = extract_error_from_response(result)
         if error:
-            return {"mappings": {}, "execution_error": f"Get mappings failed: {error}"}
+            return {"flattened_fields": {}, "execution_error": f"Get mappings failed: {error}"}
         
-        # Extract mappings
+        # Extract and flatten mappings
         mappings = extract_mappings_from_response(result)
+        logger.info(f"Raw mappings extracted: {mappings}")
+        
+        flattened_fields = deduplicate_fields_across_indices(mappings)
+        logger.info(f"Flattened fields: {flattened_fields}")
         
         return {
-            "mappings": mappings,
+            "flattened_fields": flattened_fields,
             "user_query": state.get("user_query"),
             "selected_indices": state.get("selected_indices"),
-            "all_indices": state.get("all_indices"),
-            "messages": [AIMessage(content=f"Retrieved mappings for {len(state['selected_indices'])} indices")]
+            "messages": [tool_message, AIMessage(content=f"Flattened {len(flattened_fields)} unique fields from {len(state['selected_indices'])} indices")]
         }
         
     except Exception as e:
-        return {"mappings": {}, "execution_error": f"Failed to get mappings: {str(e)}"}
+        return {"flattened_fields": {}, "execution_error": f"Failed to get mappings: {str(e)}"}
 
 
 async def generate_esql_node(state: AgentState) -> AgentState:
     """Generate ES|QL query using LLM."""
     logger.info("Starting generate_esql_node")
-    # Optimize mappings for prompt - only include field names to avoid large payloads
-    mappings = state.get("mappings", {})
-    field_summary = {}
-    for index, mapping in mappings.items():
-        if isinstance(mapping, dict) and "properties" in mapping:
-            field_summary[index] = list(mapping["properties"].keys())[:50]  # Limit to 50 fields
+    flattened_fields = state.get("flattened_fields", {})
     
     prompt = f"""
-    You are an expert ES|QL generator. Create an optimized, production-ready query.
-    
-    USER REQUEST: {state.get("user_query", "")}
-    INDICES: {state.get("selected_indices", [])}
-    AVAILABLE_FIELDS: {field_summary}
+    Generate ES|QL for: {state.get("user_query", "")}
+    Indices: {state.get("selected_indices", [])}
+    Available fields: {flattened_fields}
     
     GENERATE ES|QL QUERY following this structure:
-    FROM index | WHERE filters | KEEP/DROP columns | EVAL computations | STATS aggregations | SORT | LIMIT
+    FROM index-pattern | WHERE filters | KEEP/DROP columns | EVAL computations | STATS aggregations | SORT | LIMIT
     
     CRITICAL RULES:
+    • Use index patterns with wildcards exactly as provided (e.g., fluent-*, kibana_sample_data_logs)
     • Field names MUST match mappings exactly (case-sensitive)
     • Filter early with WHERE for performance
     • Use STATS for aggregations: COUNT(*), SUM(), AVG(), MAX(), MIN()
@@ -221,11 +253,13 @@ async def generate_esql_node(state: AgentState) -> AgentState:
     • Time ranges: @timestamp >= NOW() - 1 DAY
     
     COMMON PATTERNS:
-    • Top N: STATS total=SUM(field) BY group | SORT total DESC | LIMIT 10
+    • Top N: STATS total=COUNT(*) BY group | SORT total DESC | LIMIT 10
     • Time series: STATS count=COUNT(*) BY bucket=BUCKET(@timestamp, 1 HOUR)
     • Filtering: WHERE field IN ("val1", "val2") AND numeric_field > 100
     • String ops: WHERE field LIKE "*pattern*" or REGEX field "regex"
     
+    IMPORTANT: Use the selected indices directly in FROM clause, including wildcards.
+               Create query with LIMIT 10.
     Return executable ES|QL ready for /_query endpoint.
     """
     
@@ -239,7 +273,7 @@ async def generate_esql_node(state: AgentState) -> AgentState:
             "generation_success": True,
             "user_query": state.get("user_query"),
             "selected_indices": state.get("selected_indices"),
-            "mappings": state.get("mappings"),
+            "flattened_fields": state.get("flattened_fields"),
             "messages": [AIMessage(content=f"Generated ES|QL query: {result.query}")]
         }
     except Exception as e:
@@ -250,12 +284,12 @@ async def generate_esql_node(state: AgentState) -> AgentState:
             "execution_error": f"ES|QL generation failed: {str(e)}",
             "user_query": state.get("user_query"),
             "selected_indices": state.get("selected_indices"),
-            "mappings": state.get("mappings")
+            "flattened_fields": state.get("flattened_fields")
         }
 
 
 async def execute_esql_node(state: AgentState) -> AgentState:
-    """Execute ES|QL query using MCP tool."""
+    """Execute ES|QL query using MCP tool with dual execution strategy."""
     query = state.get("revised_esql_query") or state.get("esql_query")
     logger.info(f"Executing ES|QL query: {query[:100]}...")
     if not query:
@@ -268,7 +302,21 @@ async def execute_esql_node(state: AgentState) -> AgentState:
         return {"execution_error": "platform_core_execute_esql tool not available"}
     
     try:
-        result = await execute_tool.ainvoke({"query": query})
+        # First execute with LIMIT 10 for LLM analysis
+        limited_query = query
+        if "LIMIT" not in query.upper():
+            limited_query = f"{query} | LIMIT 10"
+        elif "LIMIT" in query.upper():
+            # Replace existing limit with 10
+            import re
+            limited_query = re.sub(r'LIMIT\s+\d+', 'LIMIT 10', query, flags=re.IGNORECASE)
+        
+        result = await execute_tool.ainvoke({"query": limited_query})
+        
+        tool_message = ToolMessage(
+            content=f"Executed ES|QL query using {execute_tool.name}",
+            tool_call_id="execute_esql_call"
+        )
         
         # Check for errors
         error = extract_error_from_response(result)
@@ -278,7 +326,12 @@ async def execute_esql_node(state: AgentState) -> AgentState:
                 "execution_error": error,
                 "retry_count": state.get("retry_count", 0) + 1,
                 "user_query": state.get("user_query"),
-                "esql_query": state.get("esql_query")
+                "selected_indices": state.get("selected_indices"),
+                "flattened_fields": state.get("flattened_fields"),
+                "all_indices": state.get("all_indices"),
+                "esql_query": state.get("esql_query"),
+                "revised_esql_query": state.get("revised_esql_query"),
+                "messages": [tool_message]
             }
         
         # Extract tabular data
@@ -290,15 +343,51 @@ async def execute_esql_node(state: AgentState) -> AgentState:
                 "execution_error": "No data returned from query",
                 "retry_count": state.get("retry_count", 0) + 1,
                 "user_query": state.get("user_query"),
-                "esql_query": state.get("esql_query")
+                "selected_indices": state.get("selected_indices"),
+                "flattened_fields": state.get("flattened_fields"),
+                "all_indices": state.get("all_indices"),
+                "esql_query": state.get("esql_query"),
+                "revised_esql_query": state.get("revised_esql_query"),
+                "messages": [tool_message]
             }
+        
+        # Execute full query with 100K limit for CSV - don't store in state to avoid memory issues
+        full_query = query
+        if "LIMIT" not in query.upper():
+            full_query = f"{query} | LIMIT 100000"
+        else:
+            import re
+            full_query = re.sub(r'LIMIT\s+\d+', 'LIMIT 100000', query, flags=re.IGNORECASE)
+        
+        # Execute and directly save to CSV without storing in state
+        csv_file_path = None
+        csv_download_url = None
+        
+        try:
+            full_result = await execute_tool.ainvoke({"query": full_query})
+            full_tabular_data = extract_tabular_data_from_response(full_result)
+            
+            if full_tabular_data and full_tabular_data.get("values"):
+                logger.info(f"Generating CSV for {len(full_tabular_data['values'])} rows")
+                csv_file_path = await save_query_result_to_csv(full_tabular_data, state.get("user_query", ""))
+                if csv_file_path:
+                    csv_download_url = generate_download_url(csv_file_path)
+                    logger.info(f"CSV generated: {csv_file_path}")
+        except Exception as e:
+            logger.error(f"Failed to generate CSV: {e}")
         
         return {
             "query_result": tabular_data,
             "execution_error": None,
             "user_query": state.get("user_query"),
+            "selected_indices": state.get("selected_indices"),
+            "flattened_fields": state.get("flattened_fields"),
+            "all_indices": state.get("all_indices"),
             "esql_query": state.get("esql_query"),
-            "messages": [AIMessage(content=f"Query executed successfully, returned {len(tabular_data.get('values', []))} rows")]
+            "revised_esql_query": state.get("revised_esql_query"),
+            "csv_file_path": csv_file_path,
+            "csv_download_url": csv_download_url,
+            "messages": [tool_message, AIMessage(content=f"Query executed successfully, returned {len(tabular_data.get('values', []))} rows for analysis")]
         }
         
     except Exception as e:
@@ -307,19 +396,23 @@ async def execute_esql_node(state: AgentState) -> AgentState:
             "execution_error": str(e),
             "retry_count": state.get("retry_count", 0) + 1,
             "user_query": state.get("user_query"),
-            "esql_query": state.get("esql_query")
+            "selected_indices": state.get("selected_indices"),
+            "flattened_fields": state.get("flattened_fields"),
+            "all_indices": state.get("all_indices"),
+            "esql_query": state.get("esql_query"),
+            "revised_esql_query": state.get("revised_esql_query")
         }
 
 
 async def esql_evaluator_node(state: AgentState) -> AgentState:
     """Evaluate and revise failed ES|QL query."""
     error = state.get("execution_error", "")
-    original_query = state.get("esql_query", "")
+    current_query = state.get("revised_esql_query") or state.get("esql_query", "")
     
     prompt = f"""
-    Original ES|QL query failed with error: {error}
-    Original query: {original_query}
-    Available mappings: {state.get("mappings", {})}
+    ES|QL query failed with error: {error}
+    Current query: {current_query}
+    Available fields: {state.get("flattened_fields", {})}
     
     Analyze the error and generate a corrected ES|QL query. Common fixes:
     - Fix field name typos
@@ -335,98 +428,109 @@ async def esql_evaluator_node(state: AgentState) -> AgentState:
         return {
             "revised_esql_plan": result.model_dump(),
             "revised_esql_query": result.query,
+            "execution_error": None,  # Clear error for retry
             "user_query": state.get("user_query"),
-            "esql_query": state.get("esql_query"),
-            "mappings": state.get("mappings"),
+            "selected_indices": state.get("selected_indices"),
+            "flattened_fields": state.get("flattened_fields"),
+            "all_indices": state.get("all_indices"),
+            "esql_query": state.get("esql_query"),  # Keep original
+            "retry_count": state.get("retry_count", 0),
             "messages": [AIMessage(content=f"Revised ES|QL query: {result.query}")]
         }
     except Exception as e:
         return {
             "execution_error": f"ES|QL revision failed: {str(e)}",
             "user_query": state.get("user_query"),
-            "esql_query": state.get("esql_query")
+            "esql_query": state.get("esql_query"),
+            "retry_count": state.get("retry_count", 0)
         }
 
 
+def _format_table_display(tabular_data: Dict[str, Any]) -> str:
+    """Format tabular data as markdown table."""
+    if not tabular_data.get("columns") or not tabular_data.get("values"):
+        return "No data available."
+    
+    columns = [col["name"] if isinstance(col, dict) else str(col) for col in tabular_data["columns"]]
+    values = tabular_data["values"]
+    
+    # Create markdown table
+    header = "| " + " | ".join(columns) + " |"
+    separator = "| " + " | ".join(["---"] * len(columns)) + " |"
+    
+    rows = []
+    for row in values:
+        formatted_row = []
+        for val in row:
+            if val is None:
+                formatted_row.append("null")
+            elif isinstance(val, str) and len(val) > 30:
+                formatted_row.append(val[:27] + "...")
+            else:
+                formatted_row.append(str(val))
+        rows.append("| " + " | ".join(formatted_row) + " |")
+    
+    return "\n".join([header, separator] + rows)
+
+
 async def finalize_answer_node(state: AgentState) -> AgentState:
-    """Create final answer from query results."""
+    """Create comprehensive final answer with CSV export for large datasets."""
     result = state.get("query_result")
     query = state.get("revised_esql_query") or state.get("esql_query")
     user_query = state.get("user_query", "")
     
     if not result:
-        return {"messages": [AIMessage(content="No results available to answer your question.")]}
+        return {"messages": [AIMessage(content="No data found.")]}
     
-    # Format the tabular data for better readability
-    formatted_data = format_tabular_data_for_display(result)
+    # Extract only column headers for LLM (token optimization)
+    columns = result.get("columns", [])
+    column_names = [col["name"] if isinstance(col, dict) else str(col) for col in columns]
+    row_count = len(result.get("values", []))
+    
+    # Get CSV info
+    csv_info = ""
+    csv_file_path = state.get("csv_file_path")
+    if csv_file_path:
+        csv_summary = get_csv_summary(csv_file_path)
+        csv_info = f"\n\n📊 **Complete Dataset Available**\nTotal rows: {csv_summary.get('row_count', 'Unknown')}\nFile size: {csv_summary.get('file_size_mb', 'Unknown')} MB\nFile: `{csv_summary.get('filename', 'dataset.csv')}`"
     
     prompt = f"""
     User asked: {user_query}
     ES|QL query executed: {query}
     
-    Query results:
-    {formatted_data}
+    Result columns: {column_names}
+    Sample rows returned: {row_count}
     
-    Provide a clear, business-focused answer to the user's question based on these results.
-    Include relevant data points and insights. Summarize key findings from the data.
+    Provide a direct answer to the user's question based on the query.
     """
     
     try:
         response = await llm.ainvoke([HumanMessage(content=prompt)])
+        
+        # Format data as table for display
+        table_display = _format_table_display(result)
+        
+        # Combine LLM response with table and CSV info
+        final_content = (response.content if hasattr(response, 'content') else str(response)) + \
+                       f"\n\n{table_display}" + csv_info
+        
         return {
-            "messages": [response],
+            "messages": [AIMessage(content=final_content)],
             "user_query": state.get("user_query"),
-            "query_result": state.get("query_result")
+            "query_result": state.get("query_result"),
+            "csv_file_path": state.get("csv_file_path"),
+            "csv_download_url": state.get("csv_download_url")
         }
     except Exception as e:
         return {
-            "messages": [AIMessage(content=f"Failed to generate final answer: {str(e)}")],
+            "messages": [AIMessage(content=f"Error: {str(e)}")],
             "user_query": state.get("user_query"),
             "query_result": state.get("query_result"),
             "execution_error": f"Finalize answer failed: {str(e)}"
         }
 
 
-async def critic_node(state: AgentState) -> AgentState:
-    """Improve the final answer using structured output."""
-    if not state.get("messages"):
-        return {"critique": {}, "improved_answer": "No answer to critique"}
-    
-    last_message = state["messages"][-1]
-    current_answer = last_message.content if hasattr(last_message, 'content') else str(last_message)
-    
-    prompt = f"""
-    Original user query: {state.get("user_query", "")}
-    Current answer: {current_answer}
-    Query results: {state.get("query_result")}
-    
-    Improve this answer by:
-    - Adding more context and insights
-    - Improving clarity and structure
-    - Highlighting key findings
-    - Making it more actionable
-    """
-    
-    structured_llm = llm.with_structured_output(CriticOutput)
-    
-    try:
-        result = await structured_llm.ainvoke([HumanMessage(content=prompt)])
-        return {
-            "critique": result.model_dump(),
-            "improved_answer": result.improved_answer,
-            "user_query": state.get("user_query"),
-            "query_result": state.get("query_result"),
-            "messages": [AIMessage(content=result.improved_answer)]
-        }
-    except Exception as e:
-        return {
-            "critique": {},
-            "improved_answer": current_answer,
-            "execution_error": f"Critic failed: {str(e)}",
-            "user_query": state.get("user_query"),
-            "query_result": state.get("query_result"),
-            "messages": [AIMessage(content=current_answer)]
-        }
+
 
 
 # ============================================================================
@@ -446,8 +550,3 @@ def should_retry(state: AgentState) -> Literal["esql_evaluator", "finalize_answe
     return "finalize_answer"
 
 
-def should_get_mappings(state: AgentState) -> Literal["get_mappings", "generate_esql"]:
-    """Determine if we need to fetch mappings."""
-    if state.get("selected_indices") and not state.get("mappings"):
-        return "get_mappings"
-    return "generate_esql"

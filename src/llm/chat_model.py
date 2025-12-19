@@ -1,6 +1,6 @@
 import os
 from langchain_aws import ChatBedrock
-from src.config import settings
+from src.config.settings import settings
 
 # Set environment variables for AWS (only if they have values and not already set)
 if settings.AWS_ACCESS_KEY_ID and "AWS_ACCESS_KEY_ID" not in os.environ:
